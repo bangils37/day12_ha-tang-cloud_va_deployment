@@ -1,21 +1,32 @@
 import redis
 from datetime import datetime
-from fastapi import HTTPException, Depends
+from fastapi import HTTPException
 from .config import settings
-from .auth import verify_api_key
 
-r = redis.from_url(settings.REDIS_URL)
+r = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
-def check_budget(user_id: str = Depends(verify_api_key)):
+async def check_budget(user_id: str):
+    """
+    Kiểm tra ngân sách hàng tháng của user.
+    Giới hạn: $10/tháng.
+    """
     month_key = datetime.now().strftime("%Y-%m")
     key = f"budget:{user_id}:{month_key}"
     
-    current = float(r.get(key) or 0)
-    if current >= settings.MONTHLY_BUDGET_USD:
-        raise HTTPException(status_code=402, detail="Monthly budget exceeded. Upgrade your plan.")
-
-def record_cost(user_id: str, cost: float):
-    month_key = datetime.now().strftime("%Y-%m")
-    key = f"budget:{user_id}:{month_key}"
-    r.incrbyfloat(key, cost)
-    r.expire(key, 32 * 24 * 3600)
+    current_spending = float(r.get(key) or 0)
+    
+    if current_spending + settings.COST_PER_REQUEST > settings.MONTHLY_BUDGET_USD:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": "Monthly budget exceeded",
+                "budget": settings.MONTHLY_BUDGET_USD,
+                "current": current_spending
+            }
+        )
+    
+    # Tăng ngân sách sau khi check thành công (thực tế nên tăng sau khi gọi LLM)
+    r.incrbyfloat(key, settings.COST_PER_REQUEST)
+    r.expire(key, 32 * 24 * 3600)  # 32 ngày để cover hết tháng
+    
+    return True

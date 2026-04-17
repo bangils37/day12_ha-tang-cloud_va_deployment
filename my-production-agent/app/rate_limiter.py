@@ -1,26 +1,37 @@
-import redis
 import time
-from fastapi import HTTPException, Depends
+import redis
+from fastapi import HTTPException
 from .config import settings
-from .auth import verify_api_key
 
-r = redis.from_url(settings.REDIS_URL)
+# Kết nối Redis
+r = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
-def check_rate_limit(user_id: str = Depends(verify_api_key)):
+async def check_rate_limit(user_id: str):
+    """
+    Sử dụng thuật toán Sliding Window với Redis Sorted Set.
+    Giới hạn: 10 requests / phút.
+    """
     now = time.time()
-    window_start = now - 60
     key = f"rate_limit:{user_id}"
+    window_start = now - 60
 
-    # Remove old requests
-    r.zremrangebyscore(key, 0, window_start)
+    # Pipeline để đảm bảo tính nguyên tử
+    pipe = r.pipeline()
+    pipe.zremrangebyscore(key, 0, window_start)  # Xóa các request cũ hơn 1 phút
+    pipe.zcard(key)                              # Đếm số request trong window
+    pipe.zadd(key, {str(now): now})              # Thêm request hiện tại
+    pipe.expire(key, 60)                         # Set TTL
+    results = pipe.execute()
 
-    # Count requests in the current window
-    request_count = r.zcard(key)
+    request_count = results[1]
 
     if request_count >= settings.RATE_LIMIT_PER_MINUTE:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
-
-    # Add current request
-    r.zadd(key, {str(now): now})
-    # Set expiry to clean up memory
-    r.expire(key, 60)
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "Rate limit exceeded",
+                "limit": settings.RATE_LIMIT_PER_MINUTE,
+                "window": "60s"
+            }
+        )
+    return True

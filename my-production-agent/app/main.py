@@ -1,87 +1,87 @@
-import signal
-import sys
-import logging
+import time
 import json
-from fastapi import FastAPI, Depends, HTTPException, Body
-from fastapi.responses import JSONResponse
+import logging
 import redis
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from .config import settings
 from .auth import verify_api_key
 from .rate_limiter import check_rate_limit
-from .cost_guard import check_budget, record_cost
+from .cost_guard import check_budget
+from utils.mock_llm import ask
 
-# Configure structured JSON logging
-class JSONFormatter(logging.Formatter):
-    def format(self, record):
-        log_obj = {
-            "level": record.levelname,
-            "message": record.getMessage(),
-            "name": record.name
-        }
-        return json.dumps(log_obj)
+# Cấu hình Structured Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"time":"%(asctime)s", "level":"%(levelname)s", "msg":%(message)s}'
+)
+logger = logging.getLogger(__name__)
 
-logger = logging.getLogger()
-# remove default handlers
-for h in logger.handlers:
-    logger.removeHandler(h)
-handler = logging.StreamHandler()
-handler.setFormatter(JSONFormatter())
-logger.addHandler(handler)
-logger.setLevel(settings.LOG_LEVEL)
+# Kết nối Redis cho conversation history
+r = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
-app = FastAPI()
-r = redis.from_url(settings.REDIS_URL)
-is_shutting_down = False
-
-def shutdown_handler(signum, frame):
-    global is_shutting_down
-    logger.info("Received shutdown signal. Stopping new requests.")
-    is_shutting_down = True
-    # Uvicorn handles the rest
-
-signal.signal(signal.SIGTERM, shutdown_handler)
-
-@app.middleware("http")
-async def reject_if_shutting_down(request, call_next):
-    if is_shutting_down:
-        return JSONResponse(status_code=503, content={"detail": "Service is shutting down"})
-    response = await call_next(request)
-    return response
+app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION)
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Liveness probe"""
+    return {"status": "ok", "timestamp": time.time()}
 
 @app.get("/ready")
 def ready():
+    """Readiness probe - Kiểm tra kết nối Redis"""
     try:
         r.ping()
         return {"status": "ready"}
     except Exception as e:
-        logger.error(f"Redis connection failed: {e}")
-        return JSONResponse(
-            status_code=503,
-            content={"status": "not ready"}
-        )
+        logger.error(json.dumps({"event": "readiness_failed", "error": str(e)}))
+        raise HTTPException(status_code=503, detail="Redis not available")
 
 @app.post("/ask")
-def ask(
-    question: str = Body(..., embed=True),
-    user_id: str = Depends(verify_api_key),
-    _rate_limit: None = Depends(check_rate_limit),
-    _budget: None = Depends(check_budget)
+async def ask_endpoint(
+    request: Request,
+    user_id: str = Depends(verify_api_key)
 ):
+    # 1. Check Rate Limit & Budget
+    await check_rate_limit(user_id)
+    await check_budget(user_id)
+
+    # 2. Parse request
+    try:
+        body = await request.json()
+        question = body.get("question")
+    except:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if not question:
+        raise HTTPException(status_code=422, detail="Question is required")
+
+    # 3. Get History from Redis
     history_key = f"history:{user_id}"
-    # get history from redis
-    history = [h.decode('utf-8') for h in r.lrange(history_key, 0, -1)]
+    history = r.lrange(history_key, -10, -1) # Lấy 10 câu gần nhất
+
+    # 4. Call LLM (Mock)
+    logger.info(json.dumps({
+        "event": "llm_call",
+        "user_id": user_id,
+        "question": question
+    }))
     
-    logger.info(f"Processing question from {user_id}")
-    answer = f"Agent response to: {question}"
-    
-    r.rpush(history_key, f"User: {question}")
-    r.rpush(history_key, f"Agent: {answer}")
-    r.expire(history_key, 3600 * 24)
-    
-    record_cost(user_id, 0.001)
-    
-    return {"question": question, "answer": answer, "history_len": len(history) // 2 + 1}
+    response = ask(question)
+
+    # 5. Save to Redis (Stateless design)
+    r.rpush(history_key, json.dumps({"q": question, "a": response}))
+    r.ltrim(history_key, -20, -1) # Giữ tối đa 20 câu
+    r.expire(history_key, 3600)   # Hết hạn sau 1h
+
+    return {
+        "answer": response,
+        "history_count": len(history),
+        "user_id": user_id
+    }
+
+@app.on_event("shutdown")
+def shutdown_event():
+    """Graceful shutdown"""
+    logger.info(json.dumps({"event": "shutdown", "msg": "Agent is shutting down gracefully"}))
+    # Close connections if any
